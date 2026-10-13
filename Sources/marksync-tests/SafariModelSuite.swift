@@ -1,5 +1,5 @@
 import Foundation
-import SafariBookmarksCore
+import MarkSyncCore
 
 /// Exercises the read path against a synthetic copy of Safari's `SafariTabs.db`.
 ///
@@ -18,7 +18,7 @@ enum SafariModelSuite {
     /// Writes a `SafariTabs.db` shaped like macOS 26's and returns its path.
     static func makeDatabase() throws -> String {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("safaribm-tests-\(UUID().uuidString)")
+            .appendingPathComponent("marksync-tests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("SafariTabs.db").path
 

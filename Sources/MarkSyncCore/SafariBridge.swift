@@ -429,18 +429,54 @@ public final class SafariBridge {
             created = true
         }
 
-        var folders = 0
-        var links = 0
+        let inserted: InsertResult
+        do {
+            inserted = try insertNodes(handle, request.nodes, into: containerID)
+        } catch {
+            // Roll back the whole container so a failed import leaves no half-written tree.
+            if created, let folder = ObjC.call(handle.collection, "bookmarkWithID:", int: containerID) {
+                delete(handle, folder)
+            }
+            throw BridgeError.mergeFailed("inserting bookmarks failed; rolled back the container folder")
+        }
 
-        func insert(_ nodes: [BookmarkNode], into parent: Int) -> Bool {
+        return ImportResult(
+            folderCount: inserted.folderCount,
+            linkCount: inserted.linkCount,
+            containerID: containerID,
+            createdContainer: created,
+            destination: request.containerTitle
+        )
+    }
+
+    public struct InsertResult {
+        /// Ids of the items created directly in the target folder. Deleting them removes
+        /// everything the call added.
+        public var createdIDs: [Int] = []
+        public var folderCount = 0
+        public var linkCount = 0
+    }
+
+    /// Appends `nodes` (recursively) to the existing folder `parentID`.
+    ///
+    /// All or nothing: if any item fails, every item this call created is deleted again.
+    public static func insertNodes(_ handle: Handle, _ nodes: [BookmarkNode], into parentID: Int) throws -> InsertResult {
+        try loadFramework()
+        guard let bookmarkClass = ObjC.class("WebBookmark") else {
+            throw BridgeError.classUnavailable("WebBookmark")
+        }
+        var result = InsertResult()
+
+        func insert(_ nodes: [BookmarkNode], into parent: Int, topLevel: Bool) -> Bool {
             for node in nodes {
                 switch node.kind {
                 case .folder:
                     guard let folder = newFolder(bookmarkClass: bookmarkClass, title: node.title, parentID: parent),
                           save(handle, folder) else { return false }
-                    folders += 1
                     let childID = ObjC.callInt(folder, "identifier") ?? -1
-                    guard insert(node.children, into: childID) else { return false }
+                    if topLevel { result.createdIDs.append(childID) }
+                    result.folderCount += 1
+                    guard insert(node.children, into: childID, topLevel: false) else { return false }
                 case .link:
                     guard let bm = newLink(
                         bookmarkClass: bookmarkClass,
@@ -449,27 +485,20 @@ public final class SafariBridge {
                         parentID: parent,
                         dateAdded: node.dateAdded
                     ), save(handle, bm) else { return false }
-                    links += 1
+                    if topLevel { result.createdIDs.append(ObjC.callInt(bm, "identifier") ?? -1) }
+                    result.linkCount += 1
                 }
             }
             return true
         }
 
-        if !insert(request.nodes, into: containerID) {
-            // Roll back the whole container so a failed import leaves no half-written tree.
-            if created, let folder = ObjC.call(handle.collection, "bookmarkWithID:", int: containerID) {
-                _ = ObjC.callBool(handle.collection, "deleteBookmark:") ?? delete(handle, folder)
+        guard insert(nodes, into: parentID, topLevel: true) else {
+            for id in result.createdIDs.reversed() {
+                if let b = ObjC.call(handle.collection, "bookmarkWithID:", int: id) { delete(handle, b) }
             }
-            throw BridgeError.mergeFailed("inserting bookmarks failed; rolled back the container folder")
+            throw BridgeError.mergeFailed("inserting into folder #\(parentID) failed; removed the \(result.createdIDs.count) item(s) already added")
         }
-
-        return ImportResult(
-            folderCount: folders,
-            linkCount: links,
-            containerID: containerID,
-            createdContainer: created,
-            destination: request.containerTitle
-        )
+        return result
     }
 
     private static func newFolder(bookmarkClass: AnyObject, title: String, parentID: Int) -> AnyObject? {
@@ -556,7 +585,7 @@ public final class SafariBridge {
         )
     }
 
-    /// The undecorated method list of a private class — used by `safaribm inspect`.
+    /// The undecorated method list of a private class — used by `marksync inspect`.
     public static func dumpMethods(of className: String) -> [String] {
         guard let cls = NSClassFromString(className) else { return [] }
         var lines: [String] = []

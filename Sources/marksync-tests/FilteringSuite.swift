@@ -1,5 +1,5 @@
 import Foundation
-import SafariBookmarksCore
+import MarkSyncCore
 
 private func sampleTree() -> BookmarkTree {
     let bar = BookmarkNode.folder("Bar", children: [

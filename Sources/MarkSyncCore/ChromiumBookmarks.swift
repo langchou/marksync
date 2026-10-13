@@ -92,45 +92,19 @@ public enum ChromiumBookmarks {
 
     // MARK: - Writing
 
-    /// Serialises a tree into the Chromium `Bookmarks` JSON shape.
-    /// Emits `bookmark_bar`, `other` and `synced` roots as Chromium expects.
+    /// Serialises a tree into a Chromium `Bookmarks` file Chrome will load.
+    ///
+    /// Roots are mapped by slot (see ``BookmarkSlot``): the bookmarks bar stays the bookmarks
+    /// bar, roots Chromium has no place for (Safari profiles, the reading list) become folders
+    /// under "Other bookmarks", and the file always has the three permanent roots, integer ids
+    /// and a valid checksum.
     public static func write(_ tree: BookmarkTree) throws -> Data {
-        var roots: [String: Any] = [:]
-        for root in tree.roots {
-            roots[root.id] = encodeNode(root.node, id: nextID())
+        let slots = SlottedBookmarks(tree, includeReadingList: true)
+        let document = ChromiumDocument()
+        for (key, slot) in [("bookmark_bar", BookmarkSlot.bar), ("other", .other), ("synced", .mobile)] {
+            guard let id = document.rootID(key) else { continue }
+            try document.insert(slots.children(slot), into: id)
         }
-        let object: [String: Any] = [
-            "checksum": "",
-            "roots": roots,
-            "version": 1,
-        ]
-        return try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-    }
-
-    private static var counter = 0
-    private static func nextID() -> String {
-        counter += 1
-        return String(counter)
-    }
-
-    private static func encodeNode(_ node: BookmarkNode, id: String) -> [String: Any] {
-        var dict: [String: Any] = [
-            "id": id,
-            "name": node.title,
-        ]
-        if let d = NetscapeHTML.plausible(node.dateAdded) { dict["date_added"] = chromiumValue(from: d) }
-        if let a = node.annotation, !a.isEmpty {
-            dict["meta_info"] = ["description": a]
-        }
-        if node.kind == .folder {
-            dict["type"] = "folder"
-            dict["children"] = node.children.enumerated().map { idx, child in
-                encodeNode(child, id: "\(id)-\(idx)")
-            }
-        } else {
-            dict["type"] = "url"
-            dict["url"] = node.href
-        }
-        return dict
+        return try document.data()
     }
 }

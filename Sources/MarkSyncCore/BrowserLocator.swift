@@ -100,24 +100,79 @@ public enum BrowserLocator {
 
     public struct Candidate {
         public var name: String
+        /// Path under `~/Library/Application Support`.
         public var applicationSupportPath: String
-        public var bookmarkFileName: String
-        public var profileSubdirectories: [String]
+        /// True when the bookmark file sits directly in `applicationSupportPath` (Opera).
+        public var isFlat: Bool
+        /// Used to refuse writing a bookmark file while the browser has it open.
+        public var bundleIdentifier: String
+        /// False for browsers whose `Bookmarks` file is not what the user sees (Arc's sidebar
+        /// lives elsewhere), so syncing *into* them would look like it did nothing.
+        public var isWritable: Bool
+
+        public init(name: String, applicationSupportPath: String, isFlat: Bool = false, bundleIdentifier: String, isWritable: Bool = true) {
+            self.name = name
+            self.applicationSupportPath = applicationSupportPath
+            self.isFlat = isFlat
+            self.bundleIdentifier = bundleIdentifier
+            self.isWritable = isWritable
+        }
     }
 
-    /// Chromium-family browsers keep `…/Application Support/<vendor>/<profile>/Bookmarks`.
+    /// Chromium-family browsers keep bookmarks in `<profile>/Bookmarks`.
+    ///
+    /// Profiles signed into a Google account may instead (or additionally) use
+    /// `AccountBookmarks`, which holds the server-side bookmarks Chrome has downloaded. Both
+    /// names are probed, and profile directories are *scanned* rather than hard-coded — a real
+    /// install routinely has `Profile 11` or `Profile 42`, which a fixed list would miss.
     public static let chromiumBrowsers: [Candidate] = [
-        .init(name: "chrome", applicationSupportPath: "Google/Chrome", bookmarkFileName: "Bookmarks", profileSubdirectories: ["Default", "Profile 1", "Profile 2", "Profile 3", "Profile 4", "Profile 5"]),
-        .init(name: "edge", applicationSupportPath: "Microsoft Edge", bookmarkFileName: "Bookmarks", profileSubdirectories: ["Default", "Profile 1", "Profile 2", "Profile 3", "Profile 4", "Profile 5"]),
-        .init(name: "brave", applicationSupportPath: "BraveSoftware/Brave-Browser", bookmarkFileName: "Bookmarks", profileSubdirectories: ["Default", "Profile 1", "Profile 2", "Profile 3"]),
-        .init(name: "chromium", applicationSupportPath: "Chromium", bookmarkFileName: "Bookmarks", profileSubdirectories: ["Default", "Profile 1", "Profile 2"]),
-        .init(name: "vivaldi", applicationSupportPath: "Vivaldi", bookmarkFileName: "Bookmarks", profileSubdirectories: ["Default", "Profile 1"]),
-        .init(name: "opera", applicationSupportPath: "com.operasoftware.Opera", bookmarkFileName: "Bookmarks", profileSubdirectories: [""]),
-        .init(name: "arc", applicationSupportPath: "Arc", bookmarkFileName: "Bookmarks", profileSubdirectories: ["User Data/Default"]),
+        .init(name: "chrome", applicationSupportPath: "Google/Chrome", bundleIdentifier: "com.google.Chrome"),
+        .init(name: "edge", applicationSupportPath: "Microsoft Edge", bundleIdentifier: "com.microsoft.edgemac"),
+        .init(name: "brave", applicationSupportPath: "BraveSoftware/Brave-Browser", bundleIdentifier: "com.brave.Browser"),
+        .init(name: "chromium", applicationSupportPath: "Chromium", bundleIdentifier: "org.chromium.Chromium"),
+        .init(name: "vivaldi", applicationSupportPath: "Vivaldi", bundleIdentifier: "com.vivaldi.Vivaldi"),
+        .init(name: "arc", applicationSupportPath: "Arc/User Data", bundleIdentifier: "company.thebrowser.Browser", isWritable: false),
+        .init(name: "opera", applicationSupportPath: "com.operasoftware.Opera", isFlat: true, bundleIdentifier: "com.operasoftware.Opera"),
     ]
 
-    public static func home(_ override: String? = nil) -> String {
-        override ?? SafariBridge.realHomeDirectory()
+    static let bookmarkFileNames = ["Bookmarks", "AccountBookmarks"]
+
+    /// Directory names under an Application Support root that are never user profiles.
+    static let nonProfileDirectories: Set<String> = [
+        "System Profile", "Guest Profile", "Crashpad", "ShaderCache", "GrShaderCache",
+        "GraphiteDawnCache", "NativeMessagingHosts", "Webstore Downloads", "Safe Browsing",
+    ]
+
+    /// How many links a Chromium bookmark file contains, or nil if it cannot be read.
+    public static func chromiumLinkCount(path: String) -> Int? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        guard let tree = try? ChromiumBookmarks.parse(data) else { return nil }
+        return tree.linkCount
+    }
+
+    /// Picks the bookmark file for one profile directory.
+    ///
+    /// `Bookmarks` wins when it actually holds something; otherwise `AccountBookmarks` is used
+    /// (a profile using account bookmarks has no local `Bookmarks` file at all, and a profile
+    /// that has one may still have an empty one). Returning both would double-import every
+    /// synced bookmark, so exactly one file per profile is chosen.
+    static func chooseBookmarkFile(in directory: String, label: String) -> BookmarkFile.Info? {
+        var local: (path: String, count: Int)?
+        var account: (path: String, count: Int)?
+        for name in bookmarkFileNames {
+            let path = "\(directory)/\(name)"
+            guard FileManager.default.fileExists(atPath: path), let count = chromiumLinkCount(path: path) else { continue }
+            if name == "Bookmarks" { local = (path, count) } else { account = (path, count) }
+        }
+        if let local, local.count > 0 {
+            return .init(path: local.path, format: .chromiumJSON, label: label)
+        }
+        if let account, account.count > 0 {
+            return .init(path: account.path, format: .chromiumJSON, label: "\(label) (account)")
+        }
+        // Nothing usable: still report the local file so the caller can say "0 bookmarks".
+        if let local { return .init(path: local.path, format: .chromiumJSON, label: label) }
+        return nil
     }
 
     /// The bookmark files for one browser name, or every known browser for `all`.
@@ -125,9 +180,7 @@ public enum BrowserLocator {
         let wanted = name.lowercased()
         let base = home(homeOverride) + "/Library/Application Support"
         var candidates = chromiumBrowsers
-        if wanted == "all" || wanted == "auto" {
-            // keep the full list
-        } else {
+        if wanted != "all" && wanted != "auto" {
             candidates = chromiumBrowsers.filter { $0.name == wanted }
             let known = chromiumBrowsers.map(\.name) + ["firefox"]
             if candidates.isEmpty && !known.contains(wanted) {
@@ -137,17 +190,21 @@ public enum BrowserLocator {
 
         var out: [BookmarkFile.Info] = []
         for candidate in candidates {
-            for profile in candidate.profileSubdirectories {
-                var dir = "\(base)/\(candidate.applicationSupportPath)"
-                if !profile.isEmpty { dir += "/\(profile)" }
-                let file = "\(dir)/\(candidate.bookmarkFileName)"
-                guard FileManager.default.fileExists(atPath: file) else { continue }
-                let label = profile.isEmpty ? candidate.name : "\(candidate.name) \(profile)"
-                out.append(.init(path: file, format: .chromiumJSON, label: label))
+            let root = "\(base)/\(candidate.applicationSupportPath)"
+            // Some builds keep the file directly in the Application Support directory.
+            if let direct = chooseBookmarkFile(in: root, label: candidate.name) { out.append(direct) }
+            guard !candidate.isFlat else { continue }
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
+            for entry in entries.sorted() where !nonProfileDirectories.contains(entry) {
+                var isDirectory: ObjCBool = false
+                let path = "\(root)/\(entry)"
+                guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
+                if let info = chooseBookmarkFile(in: path, label: "\(candidate.name) \(entry)") {
+                    out.append(info)
+                }
             }
         }
 
-        // Firefox stores bookmarks inside `places.sqlite`; exporting requires reading it.
         if wanted == "firefox" || wanted == "all" || wanted == "auto" {
             out.append(contentsOf: firefoxBookmarkFiles(home: homeOverride))
         }
@@ -155,8 +212,13 @@ public enum BrowserLocator {
         return out
     }
 
-    /// Firefox keeps bookmarks in SQLite. We surface the database and let the caller decide,
-    /// since converting it needs `moz_bookmarks`/`moz_places` joins.
+    /// Resolves `~` against the real account home, not the sandbox container.
+    /// `MARKSYNC_HOME` redirects it, so a sync can be rehearsed against a scratch copy.
+    public static func home(_ override: String? = nil) -> String {
+        override ?? ProcessInfo.processInfo.environment["MARKSYNC_HOME"] ?? SafariBridge.realHomeDirectory()
+    }
+
+    /// Firefox keeps bookmarks in SQLite, one `places.sqlite` per profile.
     public static func firefoxBookmarkFiles(home homeOverride: String? = nil) -> [BookmarkFile.Info] {
         let base = home(homeOverride) + "/Library/Application Support/Firefox/Profiles"
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: base) else { return [] }

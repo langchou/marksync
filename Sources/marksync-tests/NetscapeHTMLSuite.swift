@@ -1,5 +1,5 @@
 import Foundation
-import SafariBookmarksCore
+import MarkSyncCore
 
 enum NetscapeHTMLSuite {
     static func sampleTree() -> BookmarkTree {

@@ -1,8 +1,8 @@
 import Foundation
-import SafariBookmarksCore
+import MarkSyncCore
 
 @main
-struct Safaribm {
+struct Marksync {
     static func main() {
         var args = Array(CommandLine.arguments.dropFirst())
         if args.isEmpty {
@@ -12,6 +12,7 @@ struct Safaribm {
         let command = args.removeFirst()
         do {
             switch command {
+            case "sync": try Commands.sync(args)
             case "read": try Commands.read(args)
             case "profiles": try Commands.profiles(args)
             case "import": try Commands.importBookmarks(args)
@@ -21,7 +22,7 @@ struct Safaribm {
             case "debug": try Commands.debug(args)
             case "convert": try Commands.convert(args)
             case "-h", "--help", "help": print(Self.usage)
-            case "--version", "version": print("safaribm \(Self.version)")
+            case "--version", "version": print("marksync \(Self.version)")
             default:
                 FileHandle.standardError.write("unknown command: \(command)\n\n".data(using: .utf8)!)
                 print(Self.usage)
@@ -36,12 +37,13 @@ struct Safaribm {
     static let version = "0.1.0"
 
     static let usage = """
-    safaribm \(version) — read, export and import Safari bookmarks
+    marksync \(version) — sync bookmarks between Safari, Chrome, Edge and other browsers
 
     USAGE
-      safaribm <command> [options]
+      marksync <command> [options]
 
     COMMANDS
+      sync        Sync bookmarks from one browser to another (you pick the direction)
       read        Print Safari's bookmark tree (text or JSON)
       profiles    List Safari profiles and their bookmark counts
       export      Export Safari bookmarks to another browser's format
@@ -50,7 +52,7 @@ struct Safaribm {
       browsers    List browsers and profiles detected on this Mac
       inspect     Dump reverse-engineering details (paths, private API methods)
 
-    Run `safaribm <command> --help` for command-specific options.
+    Run `marksync <command> --help` for command-specific options.
     """
 }
 
@@ -99,6 +101,7 @@ struct Args {
         "out", "output", "o", "format", "f", "profile", "p", "parent", "source", "s",
         "type", "t", "name", "db", "browser", "b", "indent", "title", "into", "only",
         "exclude", "flatten", "max-depth", "dedupe", "class", "max-entries", "max-depth", "undo",
+        "from", "to", "from-profile", "to-profile",
     ]
     private static func takesValue(_ name: String) -> Bool { valueOptions.contains(name) }
 
@@ -133,35 +136,25 @@ enum Commands {
     static func read(_ argv: [String]) throws {
         let a = try Args(argv)
         if a.has("help") { print("""
-        safaribm read — print Safari's bookmark tree
+        marksync read — print Safari's bookmarks (Favorites, sidebar, reading list)
 
         OPTIONS
           --format text|json     output format (default: text)
-          --db <path>            read a copy of SafariTabs.db instead of the live database
-          --profile <name|id>    restrict output to one profile
-          --hidden               include hidden folders and special roots
-          --class <name>         (advanced) dump a private class instead of bookmarks
+          --no-reading-list      leave out the reading list
+          --class <name>         (advanced) dump a private WebBookmarks class instead
 
-        The live database lives at
-          ~/Library/Containers/com.apple.Safari/Data/Library/Safari/SafariTabs.db
+        Safari's bookmarks live in ~/Library/Safari/Bookmarks.plist.
         """)
             return
         }
-        let path = a.value("db") ?? SafariBridge.safariDatabasePath()
-        let handle = try SafariBridge.open(path: path)
-        let model = try SafariModel(handle: handle)
-
         if a.has("class") || a.value("class") != nil {
+            try SafariBridge.loadFramework()
             let cls = a.value("class") ?? "WebBookmarkCollection"
             for line in SafariBridge.dumpMethods(of: cls) { print(line) }
             return
         }
-
-        let tree = try model.tree(
-            profile: a.value("profile"),
-            includeHidden: a.has("hidden"),
-            includeReadingList: a.has("reading-list") || a.has("readinglist")
-        )
+        let tree = try SafariBookmarksPlist.load(path: SafariBookmarksPlist.defaultPath())
+            .tree(includeReadingList: !a.has("no-reading-list"))
         if a.value("format", "f") == "json" {
             print(try JSONOutput.string(for: tree))
         } else {
@@ -175,7 +168,10 @@ enum Commands {
         let a = try Args(argv)
         if a.has("help") {
             print("""
-            safaribm profiles — list Safari profiles
+            marksync profiles — list Safari profiles found in SafariTabs.db
+
+            Profiles hold windows and tabs; the counts are tabs, not bookmarks. Safari's
+            bookmarks are shared by all profiles and live in Bookmarks.plist (`marksync read`).
 
             OPTIONS
               --format text|json   output format (default: text)
@@ -196,7 +192,7 @@ enum Commands {
             print("database: \(handle.databasePath)")
             if profiles.isEmpty { print("(no profiles found)") }
             for p in profiles {
-                print(String(format: "  #%-4d %-24s  %4d links  %3d folders", p.id, (p.title as NSString).utf8String!, p.linkCount, p.folderCount))
+                print(String(format: "  #%-4d %-24s  %4d tabs", p.id, (p.title as NSString).utf8String!, p.linkCount))
             }
         }
     }
@@ -207,7 +203,7 @@ enum Commands {
         let a = try Args(argv)
         if a.has("help") {
             print("""
-            safaribm export — export Safari bookmarks for another browser
+            marksync export — export Safari bookmarks for another browser
 
             OPTIONS
               --format html|chromium|json   output format (default: html)
@@ -215,27 +211,20 @@ enum Commands {
                                             chromium  Chrome/Edge/Brave "Bookmarks" JSON
                                             json      this tool's own JSON tree
               --out, -o <path>              write to a file (default: stdout)
-              --profile <name|id>           export a single profile
               --title <name>                folder title to wrap the export in
               --only <substr>               keep only folders whose title matches
               --exclude <substr>            drop folders whose title matches
               --no-reading-list             skip the reading list
-              --hidden                      include hidden folders
 
             EXAMPLES
-              safaribm export --format html --out ~/Desktop/safari-bookmarks.html
-              safaribm export --format chromium --out ~/chromium-Bookmarks
+              marksync export --format html --out ~/Desktop/safari-bookmarks.html
+              marksync export --format chromium --out ~/chromium-Bookmarks
             """)
             return
         }
         let format = (a.value("format", "f") ?? "html").lowercased()
-        let handle = try SafariBridge.open(path: a.value("db") ?? SafariBridge.safariDatabasePath())
-        let model = try SafariModel(handle: handle)
-        var tree = try model.tree(
-            profile: a.value("profile"),
-            includeHidden: a.has("hidden"),
-            includeReadingList: !a.has("no-reading-list")
-        )
+        var tree = try SafariBookmarksPlist.load(path: SafariBookmarksPlist.defaultPath())
+            .tree(includeReadingList: !a.has("no-reading-list"))
         tree = Filtering.apply(
             tree,
             only: a.value("only"),
@@ -256,34 +245,37 @@ enum Commands {
         let a = try Args(argv)
         if a.has("help") {
             print("""
-            safaribm import — import bookmarks from another browser into Safari
+            marksync import — add a file's or another browser's bookmarks to Safari, in one folder
+
+            To merge bookmarks into the matching places instead (bar → Favorites, …), use
+            `marksync sync`.
 
             OPTIONS
-              --source, -s <path>        file to import (required)
-              --format, -f <format>      auto (default) | html | chromium | json | auto-browser
+              --source, -s <path>        file to import (html, Chromium JSON, tree JSON, places.sqlite)
+              --format, -f <format>      auto (default) | html | chromium | json
               --browser, -b <name>       read a browser's own bookmark file:
-                                         chrome | edge | brave | chromium | opera | vivaldi | all
-              --profile <name|id>        Safari profile to import into (default: first profile)
-              --parent <id>              explicit destination folder id (advanced)
+                                         chrome | edge | brave | chromium | opera | vivaldi | firefox | all
               --title <name>             container folder name (default: "Imported <date>")
-              --no-container             import directly into the destination folder
-              --dedupe                   skip bookmarks whose URL is already in the destination
+              --no-container             add the items directly, without a container folder
+              --favorites                add to Favorites instead of the bookmarks sidebar
+              --dedupe                   skip bookmarks whose URL Safari already has
               --dry-run                  show what would happen, change nothing
               --yes                      skip the confirmation prompt
-              --undo <folderID>          delete a folder created by an earlier import
-                                         (the id is printed at the end of every import)
+              --undo <log|last>          revert an import (same as `marksync sync --undo`)
+
+            Safari must be quit (⌘Q) while marksync writes ~/Library/Safari/Bookmarks.plist.
 
             EXAMPLES
-              safaribm import --browser edge --dry-run
-              safaribm import --source ~/Downloads/bookmarks.html --yes
-              safaribm import --browser chrome --profile Work --title "From Chrome"
-              safaribm import --undo 52
+              marksync import --browser edge --dry-run
+              marksync import --source ~/Downloads/bookmarks.html --yes
+              marksync import --browser chrome --title "From Chrome" --favorites
+              marksync import --undo last
             """)
             return
         }
 
-        if let undoID = a.int("undo") {
-            try undoImport(folderID: undoID, database: a.value("db"), assumeYes: a.has("yes"))
+        if let undo = a.value("undo") ?? (a.has("undo") ? "last" : nil) {
+            try undoSync(undo, assumeYes: a.has("yes"))
             return
         }
 
@@ -306,134 +298,62 @@ enum Commands {
             tree = BookmarkTree(source: "browser", roots: roots)
             sourceDescription = files.map(\.path).joined(separator: ", ")
         } else if let source = a.value("source", "s") {
-            let parsed = try BookmarkFile.read(path: source, explicitFormat: a.value("format", "f"))
-            tree = parsed
+            tree = try BookmarkFile.read(path: source, explicitFormat: a.value("format", "f"))
             sourceDescription = source
         } else {
             throw Fail.message("provide --source <file> or --browser <name> (see --help)")
         }
 
         guard var imported = tree else { throw Fail.message("nothing to import") }
-        imported = Filtering.apply(
-            imported,
-            only: a.value("only"),
-            exclude: a.value("exclude"),
-            wrapTitle: nil,
-            flatten: a.has("flatten")
-        )
+        imported = Filtering.apply(imported, only: a.value("only"), exclude: a.value("exclude"), wrapTitle: nil, flatten: a.has("flatten"))
         guard imported.linkCount > 0 else { throw Fail.message("the source contains no bookmarks") }
 
-        let handle = try SafariBridge.open(path: a.value("db") ?? SafariBridge.safariDatabasePath())
-        let model = try SafariModel(handle: handle)
+        let path = SafariBookmarksPlist.defaultPath()
+        let snapshot = FileSnapshot(path: path)
+        let plist = try SafariBookmarksPlist.load(path: path)
+        let targets = plist.mergeTarget()
+        let favorites = a.has("favorites")
+        guard let parentRef = (favorites ? targets[.bar] : targets[.other])?.ref else {
+            throw Fail.message("Safari's Bookmarks.plist has no Favorites folder; open Safari once and try again")
+        }
 
-        // Pick the destination folder.
-        let destination: SafariModel.Destination
-        if let parent = a.int("parent") {
-            destination = SafariModel.Destination(parentID: parent, description: "folder #\(parent)")
-        } else if let element = try model.destination(profileNamed: a.value("profile")) {
-            destination = element
-        } else {
-            throw Fail.message("""
-            could not find a writable destination folder in Safari.
-            Make sure Safari has run at least once on this account, or pass --parent <folder id>.
-            """)
+        if a.has("dedupe") {
+            var existing: Set<String> = []
+            plist.tree().rootNode.walk { node, _ in if let url = node.url { existing.insert(url) } }
+            let before = imported.linkCount
+            imported = BookmarkTree(source: imported.source, roots: imported.roots.compactMap { root in
+                Dedupe.prune(root.node, existing: existing).map { BookmarkTree.RootFolder(id: root.id, title: root.title, node: $0) }
+            })
+            print("dedupe       \(before - imported.linkCount) already in Safari, \(imported.linkCount) remain")
+            guard imported.linkCount > 0 else { throw Fail.message("every bookmark is already in Safari (nothing to do)") }
         }
 
         let containerTitle = a.value("title") ?? defaultContainerTitle()
-        var nodes = imported.roots.map(\.node)
-
-        // --dedupe: drop links whose URL is already somewhere under the destination.
-        if a.has("dedupe") {
-            let existing = model.existingURLs(under: destination.parentID)
-            let before = imported.linkCount
-            let deduped = BookmarkTree(
-                source: imported.source,
-                roots: imported.roots.compactMap { root in
-                    Dedupe.prune(root.node, existing: existing).map {
-                        BookmarkTree.RootFolder(id: root.id, title: root.title, node: $0)
-                    }
-                }
-            )
-            let removed = before - deduped.linkCount
-            nodes = deduped.roots.map(\.node)
-            imported = deduped
-            print("dedupe       \(removed) already present, \(deduped.linkCount) remain")
-            guard deduped.linkCount > 0 else { throw Fail.message("every bookmark is already in the destination (nothing to do)") }
-        }
+        let content = imported.roots.map(\.node)
+        let nodes = a.has("no-container") ? content : [.folder(containerTitle, children: content)]
 
         print("source       \(sourceDescription)")
         print("found        \(imported.linkCount) bookmarks in \(imported.folderCount) folders")
-        print("destination  \(destination.description)  [\(handle.databasePath)]")
-        if a.has("no-container") {
-            print("container    (none — importing directly into the destination)")
-        } else {
-            print("container    \(containerTitle)")
-        }
+        print("destination  Safari \(favorites ? "Favorites" : "bookmarks sidebar")  [\(path)]")
+        print("container    \(a.has("no-container") ? "(none)" : containerTitle)")
         if dryRun {
             print("\n--dry-run: nothing was written. Tree that would be imported:")
             print(TextOutput.render(imported, maxDepth: a.int("max-depth"), limit: a.int("max-entries")))
             return
         }
-        guard SafariBridge.isWritable(handle) else {
-            throw Fail.message("""
-            \(handle.databasePath) is not writable.
-
-            Safari stores bookmarks inside its sandbox container. Run this command with an
-            unsandboxed process (a normal terminal is fine) or grant Full Disk Access to the
-            terminal in System Settings › Privacy & Security › Full Disk Access.
-            """)
+        guard !BrowserLocator.isRunning(bundleIdentifier: BrowserLocator.safariBundleIdentifier) else {
+            throw SyncError.browserRunning("Safari")
         }
+        if !a.has("yes") && !confirm("Import into Safari?") { throw Fail.message("aborted") }
 
-        if !a.has("yes") && !confirm("Import into \(destination.description)?") {
-            throw Fail.message("aborted")
-        }
-
-        let request = SafariBridge.ImportRequest(
-            parentID: destination.parentID,
-            containerTitle: a.has("no-container") ? "" : containerTitle,
-            nodes: nodes,
-            reuseExistingContainer: !a.has("no-container")
-        )
-        let result: SafariBridge.ImportResult
-        if a.has("no-container") {
-            result = try importDirect(handle: handle, parentID: destination.parentID, nodes: nodes)
-        } else {
-            result = try SafariBridge.importNodes(handle, request: request)
-        }
-        SafariBridge.notifySafariToReload()
-        print("\nimported     \(result.linkCount) bookmarks, \(result.folderCount) folders")
-        print("container    #\(result.containerID) \(result.destination)\(result.createdContainer ? " (created)" : " (reused)")")
-        print("\nSafari has been asked to reload its bookmarks. If the sidebar does not update,")
-        print("quit and reopen Safari (⌘Q) — the change is already committed to the database.")
-        print("\nTo undo this import: safaribm import --undo \(result.containerID)")
-    }
-
-    /// Removes a folder created by a previous import, together with everything inside it.
-    static func undoImport(folderID: Int, database: String?, assumeYes: Bool) throws {
-        let path = database ?? SafariBridge.safariDatabasePath()
-        let model = try SafariModel(databasePath: path)
-        guard let folder = model.row(folderID), folder.isFolder else {
-            throw Fail.message("no folder #\(folderID) in \(path)")
-        }
-        let links = model.subtreeLinkCount(folderID)
-        let folders = model.subtreeFolderCount(folderID)
-        print("folder       #\(folderID) '\(folder.title)' in \(path)")
-        print("contains     \(links) bookmarks in \(folders) folders")
-        if !assumeYes && !confirm("Delete this folder and everything inside it from Safari?") {
-            throw Fail.message("aborted")
-        }
-        let handle = try SafariBridge.open(path: path)
-        try SafariBridge.deleteFolder(handle, id: folderID)
-        SafariBridge.notifySafariToReload()
-        print("deleted      #\(folderID) '\(folder.title)'")
-    }
-
-    /// Imports straight into an existing folder, without creating a container.
-    static func importDirect(handle: SafariBridge.Handle, parentID: Int, nodes: [BookmarkNode]) throws -> SafariBridge.ImportResult {
-        try SafariBridge.importNodes(
-            handle,
-            request: .init(parentID: parentID, containerTitle: "", nodes: nodes, reuseExistingContainer: true)
-        )
+        let created = try plist.insert(nodes, into: parentRef)
+        let data = try plist.data()
+        try ensureUnchanged(snapshot)
+        let backupPath = try backup(path)
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        let logPath = try SyncUndoLog(from: "import", to: "safari", safariPlist: path, createdUUIDs: created, backupFile: backupPath).save()
+        print("\nimported     \(imported.linkCount) bookmarks")
+        print("undo         marksync import --undo \"\(logPath)\"   (or: marksync import --undo last)")
     }
 
     static func defaultContainerTitle() -> String {
@@ -448,7 +368,7 @@ enum Commands {
         let a = try Args(argv)
         if a.has("help") {
             print("""
-            safaribm convert — convert between bookmark file formats (never touches Safari)
+            marksync convert — convert between bookmark file formats (never touches Safari)
 
             OPTIONS
               --source, -s <path>      input file (required)
@@ -458,8 +378,8 @@ enum Commands {
               --flatten                drop folder nesting, keep one flat list
 
             EXAMPLES
-              safaribm convert -s ~/edge-Bookmarks -t html -o ~/edge.html
-              safaribm convert -s ~/safari.html -t chromium -o ~/chromium-Bookmarks
+              marksync convert -s ~/edge-Bookmarks -t html -o ~/edge.html
+              marksync convert -s ~/safari.html -t chromium -o ~/chromium-Bookmarks
             """)
             return
         }
@@ -476,7 +396,7 @@ enum Commands {
         let a = try Args(argv)
         if a.has("help") {
             print("""
-            safaribm browsers — list browsers with bookmark files on this Mac
+            marksync browsers — list browsers with bookmark files on this Mac
 
             OPTIONS
               --format text|json   output format (default: text)
@@ -490,28 +410,39 @@ enum Commands {
         let installed = BrowserLocator.installed()
         if a.value("format", "f") == "json" {
             let payload: [String: Any] = [
-                "safari": ["database": SafariBridge.safariDatabasePath()],
+                "safari": ["bookmarks": SafariBookmarksPlist.defaultPath()],
                 "browsers": installed.map { browser in
-                    ["name": browser.name, "profiles": browser.profiles.map { ["path": $0.path, "label": $0.label] }]
+                    ["name": browser.name, "profiles": browser.profiles.map { profile -> [String: Any] in
+                        ["path": profile.path, "label": profile.label,
+                         "format": profile.format.rawValue,
+                         "bookmarks": BrowserLocator.chromiumLinkCount(path: profile.path) ?? 0]
+                    }]
                 },
             ]
             print(try JSONOutput.string(payload))
             return
         }
         print("safari")
-        print("  database  \(SafariBridge.safariDatabasePath())")
-        let present = FileManager.default.fileExists(atPath: SafariBridge.safariDatabasePath())
-        print("  present   \(present)")
-        if present, let model = try? SafariModel(databasePath: SafariBridge.safariDatabasePath()) {
-            for p in model.profiles {
-                print("  profile   #\(p.localFolderID) '\(p.title)'  \(p.linkCount) bookmarks")
-            }
+        let plistPath = SafariBookmarksPlist.defaultPath()
+        print("  bookmarks \(plistPath)")
+        do {
+            let slots = try SafariBookmarksPlist.load(path: plistPath).syncSource()
+            print("  favorites \(slots.children(.bar).reduce(0) { $0 + $1.linkCount })")
+            print("  sidebar   \(slots.children(.other).reduce(0) { $0 + $1.linkCount })")
+        } catch {
+            print("  (unreadable: \(error))")
         }
         if installed.isEmpty { print("\nno other browsers with bookmark files were found") }
         for browser in installed {
             print("\n\(browser.name)")
             for profile in browser.profiles {
-                print("  \(profile.label.padding(toLength: 22, withPad: " ", startingAt: 0)) \(profile.path)")
+                let count: String
+                switch profile.format {
+                case .chromiumJSON: count = "\(BrowserLocator.chromiumLinkCount(path: profile.path) ?? 0)"
+                case .firefoxSQLite: count = (try? FirefoxBookmarks.parse(path: profile.path).linkCount).map(String.init) ?? "?"
+                default: count = "?"
+                }
+                print("  \(profile.label.padding(toLength: 30, withPad: " ", startingAt: 0)) \(count.padding(toLength: 5, withPad: " ", startingAt: 0)) \(profile.path)")
             }
         }
     }
@@ -547,7 +478,7 @@ enum Commands {
         let topic = a.rest.first ?? "all"
         if a.has("help") {
             print("""
-            safaribm inspect — reverse-engineering details
+            marksync inspect — reverse-engineering details
 
             TOPICS
               paths       where Safari keeps bookmarks on this machine

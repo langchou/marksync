@@ -8,7 +8,7 @@ public enum SafariModelError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .noSuchProfile(let name):
-            return "no Safari profile matching '\(name)' (run `safaribm profiles` to list them)"
+            return "no Safari profile matching '\(name)' (run `marksync profiles` to list them)"
         case .noDatabase(let path):
             return "no Safari bookmark database at \(path)"
         }
@@ -435,7 +435,7 @@ public final class SafariModel {
         }
     }
 
-    /// Flat row dump used by `safaribm inspect db`.
+    /// Flat row dump used by `marksync inspect db`.
     public func rowDump() -> [String] {
         var out: [String] = []
         out.append("id     parent special type sub hidden kids title / url")

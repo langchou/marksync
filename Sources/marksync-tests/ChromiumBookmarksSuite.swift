@@ -1,5 +1,5 @@
 import Foundation
-import SafariBookmarksCore
+import MarkSyncCore
 
 /// A trimmed-down but structurally faithful Chrome `Bookmarks` file.
 let chromiumFixture = """
@@ -110,7 +110,7 @@ enum ChromiumBookmarksSuite {
 enum FirefoxSuite {
     static func makePlaces() throws -> String {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("safaribm-ff-\(UUID().uuidString)")
+            .appendingPathComponent("marksync-ff-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("places.sqlite").path
         let sql = """
@@ -188,6 +188,66 @@ enum FormatDetectionSuite {
 
         TestCase("returns nil for unsupported files") {
             expectNil(BookmarkFormat.detect(Data("bplist00\u{01}\u{02}".utf8), path: "Bookmarks.plist"))
+        },
+    ]
+}
+
+/// The browser locator must find profile directories it was never told about, and must pick
+/// exactly one bookmark file per profile (`Bookmarks` when it holds something, otherwise
+/// `AccountBookmarks`).
+enum BrowserLocatorSuite {
+    static func makeFakeHome() throws -> String {
+        let home = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("marksync-home-\(UUID().uuidString)")
+        let base = home.appendingPathComponent("Library/Application Support")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+
+        func write(_ path: String, _ contents: String) throws {
+            let url = base.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(contents.utf8).write(to: url)
+        }
+        func chromium(_ names: [String]) -> String {
+            let kids = names.map { #"{"type":"url","name":"\#($0)","url":"https://\#($0).example/"}"# }.joined(separator: ",")
+            return #"{"roots":{"bookmark_bar":{"type":"folder","name":"bar","children":[\#(kids)]}},"version":1}"#
+        }
+        // A profile with a populated local file, one with only an account file, one with an
+        // empty local file plus a populated account file, and a non-profile directory.
+        try write("Google/Chrome/Default/Bookmarks", chromium(["local"]))
+        try write("Google/Chrome/Profile 11/AccountBookmarks", chromium(["acct1", "acct2"]))
+        try write("Google/Chrome/Profile 3/Bookmarks", #"{"roots":{"bookmark_bar":{"type":"folder","name":"bar","children":[]}}}"#)
+        try write("Google/Chrome/Profile 3/AccountBookmarks", chromium(["fallback"]))
+        try write("Google/Chrome/System Profile/Bookmarks", chromium(["nope"]))
+        try write("Microsoft Edge/Default/Bookmarks", chromium(["edge1"]))
+        return home.path
+    }
+
+    static let all: [TestCase] = [
+        TestCase("finds unknown profile directories and AccountBookmarks") {
+            let home = try makeFakeHome()
+            let files = try BrowserLocator.bookmarkFiles(forBrowser: "chrome", home: home)
+            let labels = files.map(\.label).sorted()
+            expectEqual(labels, ["chrome Default", "chrome Profile 11 (account)", "chrome Profile 3 (account)"])
+            let byLabel = Dictionary(uniqueKeysWithValues: files.map { ($0.label, $0.path) })
+            expectTrue(byLabel["chrome Profile 11 (account)"]?.hasSuffix("AccountBookmarks") ?? false)
+            // Profile 3 has an *empty* local file and a populated account file: the account file
+            // must win, otherwise the bookmarks would be silently invisible.
+            expectTrue(byLabel["chrome Profile 3 (account)"]?.hasSuffix("AccountBookmarks") ?? false)
+            expectEqual(byLabel["chrome Default"]?.hasSuffix("/Default/Bookmarks"), true, "a populated local file wins")
+        },
+
+        TestCase("counts links per file") {
+            let home = try makeFakeHome()
+            let files = try BrowserLocator.bookmarkFiles(forBrowser: "chrome", home: home)
+            let counts = files.map { BrowserLocator.chromiumLinkCount(path: $0.path) ?? -1 }
+            expectEqual(counts.reduce(0, +), 4, "1 local + 2 account + 1 fallback")
+        },
+
+        TestCase("other browsers are unaffected") {
+            let home = try makeFakeHome()
+            expectEqual(try BrowserLocator.bookmarkFiles(forBrowser: "edge", home: home).count, 1)
+            expectEqual(try BrowserLocator.bookmarkFiles(forBrowser: "all", home: home).count, 4)
+            expectThrows { _ = try BrowserLocator.bookmarkFiles(forBrowser: "netscape", home: home) }
         },
     ]
 }
